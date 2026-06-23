@@ -3071,38 +3071,35 @@ function renderPengaturan(host){
       <div class="user-pill" style="font-size:11px">${nowStr}</div>
     </div>
 
-    <!-- GOOGLE SHEETS SYNC -->
+    <!-- CLOUD SYNC (SUPABASE) -->
     <div class="section">
-      <div class="section-head"><h3>☁️ Sinkronisasi Google Sheets</h3></div>
-      <div class="gs-guide">
-        <b>💡 Cara setup (sekali saja):</b>
-        <ol style="margin-top:6px">
-          <li>Buka Google Sheets baru → menu <b>Extensions → Apps Script</b></li>
-          <li>Tempel kode dari tombol <b>Lihat Kode Apps Script</b> di bawah, lalu <b>Deploy → New deployment → Web app</b> (akses: <i>Anyone</i>)</li>
-          <li>Salin URL Web App ke kolom di bawah dan klik <b>Simpan</b></li>
-          <li>Klik <b>Tarik Data dari Cloud</b> untuk memuat data awal. Setelahnya semua perubahan otomatis tersinkron.</li>
-        </ol>
+      <div class="section-head"><h3>☁️ Sinkronisasi Cloud</h3></div>
+      <p class="muted" style="font-size:12.5px">Data otomatis tersinkron ke database cloud. Tombol di bawah untuk sinkron manual.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+        <button class="btn btn-ghost" onclick="pullFromCloud()">📥 Tarik dari Cloud</button>
+        <button class="btn btn-ghost" onclick="pushToCloud()">📤 Dorong ke Cloud</button>
       </div>
-      <div class="field"><label>URL Web App (Google Apps Script)</label>
-        <input id="gs-url" type="url" value="${esc(gs.url||'')}" placeholder="https://script.google.com/macros/s/…/exec">
+      <div class="gs-status aktif ${gs.lastSyncStatus==='error'?'err':''}" id="gs-status-line" style="margin-top:10px">
+        Status: <b>${gs.lastSyncStatus==='error'?'error':'aktif'}</b>
+        · Sinkron terakhir: ${gs.lastSync ? fmtDateTime(gs.lastSync) : 'belum pernah'}
+        ${gs.lastSyncError ? `<span class="gs-err-detail">⚠️ ${esc(gs.lastSyncError)}</span>` : ''}
       </div>
-      <div class="field"><label>Token Rahasia (opsional, harus sama dengan SECRET_TOKEN di Apps Script)</label>
-        <input id="gs-token" type="text" value="${esc(gs.token||'')}" placeholder="token rahasia">
+    </div>
+
+    <!-- MIGRASI DARI GOOGLE SHEETS -->
+    <div class="section">
+      <div class="section-head"><h3>📦 Migrasi dari Google Sheets (sekali saja)</h3></div>
+      <p class="muted" style="font-size:12.5px">Punya data lama di Google Sheets versi sebelumnya? Tempel URL Web App Apps Script lama untuk menariknya, lalu klik <b>Dorong ke Cloud</b>.</p>
+      <div class="field"><label>URL Web App Apps Script lama</label>
+        <input id="mig-url" type="url" placeholder="https://script.google.com/macros/s/…/exec">
       </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px">
-        <button class="btn btn-primary" onclick="saveGSConfig()">💾 Simpan Konfigurasi</button>
-        <button class="btn btn-ghost" onclick="pullFromCloud()">📥 Tarik Data dari Cloud</button>
-        <button class="btn btn-ghost" onclick="pushToCloud()">📤 Dorong Semua ke Cloud</button>
-        <button class="btn btn-warning" onclick="showAppsScript()">📋 Lihat Kode Apps Script</button>
+      <div class="field"><label>Token Rahasia (jika ada)</label>
+        <input id="mig-token" type="text" placeholder="kosongkan jika tanpa token">
       </div>
-      <div class="gs-status ${gs.url?'aktif':''} ${gs.lastSyncStatus==='error'?'err':''}" id="gs-status-line">
-        ${gs.url
-          ? `Status: <b>${gs.lastSyncStatus==='error'?'error':'aktif'}</b>
-             · Sinkron sukses terakhir: ${gs.lastSync ? fmtDateTime(gs.lastSync) : 'belum pernah'}
-             ${gs.lastSyncAttempt && gs.lastSyncAttempt!==gs.lastSync ? `<br>Percobaan terakhir: ${fmtDateTime(gs.lastSyncAttempt)}` : ''}
-             ${gs.lastSyncError ? `<span class="gs-err-detail">⚠️ ${esc(gs.lastSyncError)}</span>` : ''}`
-          : 'Status: <b>belum dikonfigurasi</b> — isi URL Web App di atas dan klik Simpan'}
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-warning" onclick="migrateFromGAS()">⬇️ Tarik Data dari Google Sheets</button>
       </div>
+      <p class="muted" style="font-size:11.5px;margin-top:6px">Data akan dimuat ke perangkat ini. Setelah berhasil, klik <b>Dorong ke Cloud</b> di atas untuk menyimpannya permanen.</p>
     </div>
 
     <!-- MARGIN & BIAYA -->
@@ -3180,13 +3177,31 @@ function renderPengaturan(host){
 /* ════════════════════════════════════════════════
    GOOGLE SHEETS SYNC FUNCTIONS
    ════════════════════════════════════════════════ */
-function saveGSConfig(){
-  const url=val('gs-url').trim(); const token=val('gs-token').trim();
-  if(url && !url.startsWith('https://')){ toast('URL tidak valid','danger'); return; }
-  const cfg=getGSConfig();
-  save(K.gsConfig, Object.assign(cfg, {url, token}));
-  toast('Konfigurasi tersimpan','success');
-  renderView();
+async function migrateFromGAS(){
+  const url=val('mig-url').trim(); const token=val('mig-token').trim();
+  if(!url.startsWith('https://')){ toast('URL tidak valid','danger'); return; }
+  if(!confirm('Tarik data dari Google Sheets lama? Data lokal saat ini akan ditimpa untuk setiap tabel yang ada di Sheets.')) return;
+  toast('Menarik data dari Google Sheets…');
+  try{
+    const res = await fetch(url, {
+      method:'POST',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body: JSON.stringify({action:'pull', token})
+    });
+    const json = await res.json();
+    if(!json.ok) throw new Error(json.msg||'Gagal');
+    const data = json.data || {};
+    let imported=0;
+    Object.keys(K).forEach(k=>{
+      if(k==='gsConfig') return;
+      const sheetKey = K[k].replace('bld_','');
+      if(data[sheetKey] !== undefined){ save(K[k], data[sheetKey]); imported++; }
+    });
+    toast(`Berhasil tarik ${imported} tabel dari Google Sheets. Sekarang klik "Dorong ke Cloud".`,'success');
+    renderView();
+  }catch(e){
+    toast('Gagal migrasi: '+e.message,'danger');
+  }
 }
 
 async function pullFromCloud(){
@@ -3259,84 +3274,6 @@ async function pushToCloud(){
   }
 }
 
-function showAppsScript(){
-  const scriptCode = `// ============================================================
-// Balanga Lo Depula v13.1 — Google Apps Script
-// Deploy sebagai Web App dengan akses: Anyone
-// ============================================================
-const SECRET_TOKEN = ''; // Isi sama dengan Token Rahasia di Pengaturan
-
-function doPost(e) {
-  try {
-    const data = JSON.parse(e.postData.contents);
-    if (SECRET_TOKEN && data.token !== SECRET_TOKEN) {
-      return out({ok: false, msg: 'Token salah'});
-    }
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-
-    if (data.action === 'push') {
-      const payload = data.payload || {};
-      Object.keys(payload).forEach(sheetKey => {
-        let sheet = ss.getSheetByName(sheetKey);
-        if (!sheet) sheet = ss.insertSheet(sheetKey);
-        sheet.clearContents();
-        const rows = payload[sheetKey];
-        if (Array.isArray(rows) && rows.length > 0) {
-          const headers = Object.keys(rows[0]);
-          sheet.appendRow(headers);
-          rows.forEach(row => sheet.appendRow(headers.map(h => {
-            const v = row[h];
-            return (typeof v === 'object') ? JSON.stringify(v) : (v === undefined ? '' : v);
-          })));
-        } else {
-          sheet.appendRow([JSON.stringify(rows)]);
-        }
-      });
-      return out({ok: true, msg: 'Data tersimpan ke Google Sheets'});
-    }
-
-    if (data.action === 'pull') {
-      const result = {};
-      ss.getSheets().forEach(sheet => {
-        const name = sheet.getName();
-        const vals = sheet.getDataRange().getValues();
-        if (vals.length <= 1) { result[name] = []; return; }
-        const headers = vals[0];
-        result[name] = vals.slice(1).map(row => {
-          const obj = {};
-          headers.forEach((h, i) => {
-            try { obj[h] = JSON.parse(row[i]); } catch(e) { obj[h] = row[i]; }
-          });
-          return obj;
-        });
-      });
-      return out({ok: true, data: result});
-    }
-
-    return out({ok: false, msg: 'Action tidak dikenal'});
-  } catch(e) {
-    return out({ok: false, msg: e.toString()});
-  }
-}
-
-function doGet(e) { return doPost(e); }
-
-function out(obj) {
-  return ContentService
-    .createTextOutput(JSON.stringify(obj))
-    .setMimeType(ContentService.MimeType.JSON);
-}`;
-
-  openModal(`
-    <h3>📋 Kode Google Apps Script</h3>
-    <p class="muted" style="font-size:12px;margin-bottom:8px">Salin kode di bawah, tempel ke Apps Script, lalu Deploy → New deployment → Web app (akses: <b>Anyone</b>).</p>
-    <textarea id="script-code" rows="16" style="font-family:monospace;font-size:11px;background:#f8f9fa">${esc(scriptCode)}</textarea>
-    <div class="modal-foot">
-      <button class="btn btn-ghost" onclick="closeModal()">Tutup</button>
-      <button class="btn btn-primary" onclick="navigator.clipboard.writeText(document.getElementById('script-code').value).then(()=>toast('Kode disalin ✓','success'))">📋 Salin Kode</button>
-    </div>
-  `);
-}
 
 function saveMarginCfg(){
   const patch={
