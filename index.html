@@ -534,6 +534,19 @@
    ════════════════════════════════════════════════ */
 const ADMIN_CODE = '88040773';
 const AUTH_KEY = 'bld_auth_v13';
+
+/* ════════════════════════════════════════════════
+   SUPABASE CONFIG (menggantikan Google Sheets)
+   ════════════════════════════════════════════════ */
+const SUPABASE_URL = 'https://pvusmexdthczkepdibxh.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB2dXNtZXhkdGhjemtlcGRpYnhoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIyMDQzMDgsImV4cCI6MjA5Nzc4MDMwOH0.C7-7aiam4FdGPZiybyqPyPAH81GqMEBNDhBrIlVmiHY';
+const SB_TABLE = 'app_data';
+const SB_HEADERS = {
+  'apikey': SUPABASE_ANON_KEY,
+  'Authorization': 'Bearer '+SUPABASE_ANON_KEY,
+  'Content-Type': 'application/json'
+};
+
 const K = {
   suppliers:      'bld_suppliers',
   orders:         'bld_orders',
@@ -2678,23 +2691,17 @@ function renderGSChip(){
   const w2=document.getElementById('gs-chip-mobile-wrap'); if(w2) w2.innerHTML=html;
 }
 async function pingGS(manual){
-  const cfg=getGSConfig();
-  if(!cfg.url){ window._gsStatus='idle'; renderGSChip(); if(manual) toast('Belum ada URL Web App. Isi di Pengaturan.','danger'); return; }
   window._gsStatus='idle'; renderGSChip();
   try{
     const ctl = new AbortController();
     const t = setTimeout(()=>ctl.abort(), 8000);
-    const res = await fetch(cfg.url, {
-      method:'POST',
-      headers:{'Content-Type':'text/plain;charset=utf-8'},
-      body: JSON.stringify({ action:'ping', token: cfg.token||'' }),
-      signal: ctl.signal,
+    const res = await fetch(SUPABASE_URL+'/rest/v1/'+SB_TABLE+'?select=key&limit=1', {
+      method:'GET', headers: SB_HEADERS, signal: ctl.signal
     });
     clearTimeout(t);
     if(!res.ok) throw new Error('HTTP '+res.status);
-    // Apps Script "ping" may not be implemented — treat 200 as connected
     window._gsStatus='on';
-    if(manual) toast('Google Sheets tersambung ✓','success');
+    if(manual) toast('Supabase tersambung ✓','success');
   }catch(e){
     window._gsStatus='off';
     if(manual) toast('Gagal terhubung: '+e.message,'danger');
@@ -3183,9 +3190,7 @@ function saveGSConfig(){
 }
 
 async function pullFromCloud(){
-  const cfg=getGSConfig();
-  if(!cfg.url){ toast('Isi URL Web App dulu','danger'); return; }
-  toast('Menarik data dari cloud…');
+  toast('Menarik data dari Supabase…');
   const markAttempt = (ok, msg)=>{
     const c=getGSConfig();
     c.lastSyncAttempt=Date.now();
@@ -3194,18 +3199,13 @@ async function pullFromCloud(){
     save(K.gsConfig, c);
   };
   try{
-    const res = await fetch(cfg.url, {
-      method:'POST',
-      headers:{'Content-Type':'text/plain;charset=utf-8'},
-      body: JSON.stringify({ action:'pull', token: cfg.token||'' })
+    const res = await fetch(SUPABASE_URL+'/rest/v1/'+SB_TABLE+'?select=key,value', {
+      method:'GET', headers: SB_HEADERS
     });
-    const json = await res.json();
-    if(!json.ok){
-      markAttempt(false, json.msg||'Error tidak diketahui');
-      toast('Gagal: '+(json.msg||'Error tidak diketahui'),'danger');
-      renderView(); return;
-    }
-    const data=json.data||{};
+    if(!res.ok) throw new Error('HTTP '+res.status+' '+(await res.text()));
+    const rows = await res.json();
+    const data={};
+    rows.forEach(r=>{ data[r.key]=r.value; });
     let imported=0;
     Object.keys(K).forEach(k=>{
       if(k==='gsConfig') return;
@@ -3216,7 +3216,7 @@ async function pullFromCloud(){
       }
     });
     markAttempt(true);
-    toast(`Data ditarik (${imported} tabel)  ✓`,'success');
+    toast(`Data ditarik (${imported} tabel) ✓`,'success');
     renderView();
   }catch(e){
     markAttempt(false, e.message);
@@ -3226,10 +3226,8 @@ async function pullFromCloud(){
 }
 
 async function pushToCloud(){
-  const cfg=getGSConfig();
-  if(!cfg.url){ toast('Isi URL Web App dulu','danger'); return; }
-  if(!confirm('Dorong semua data lokal ke Google Sheets? Data di cloud akan ditimpa.')) return;
-  toast('Mendorong data ke cloud…');
+  if(!confirm('Dorong semua data lokal ke Supabase? Data di cloud akan ditimpa.')) return;
+  toast('Mendorong data ke Supabase…');
   const markAttempt = (ok, msg)=>{
     const c=getGSConfig();
     c.lastSyncAttempt=Date.now();
@@ -3238,25 +3236,21 @@ async function pushToCloud(){
     save(K.gsConfig, c);
   };
   try{
-    const payload={};
+    const nowIso = new Date().toISOString();
+    const rows=[];
     Object.keys(K).forEach(k=>{
       if(k==='gsConfig') return;
       const sheetKey = K[k].replace('bld_','');
-      payload[sheetKey] = load(K[k]);
+      rows.push({ key: sheetKey, value: load(K[k]), updated_at: nowIso });
     });
-    const res = await fetch(cfg.url, {
+    const res = await fetch(SUPABASE_URL+'/rest/v1/'+SB_TABLE+'?on_conflict=key', {
       method:'POST',
-      headers:{'Content-Type':'text/plain;charset=utf-8'},
-      body: JSON.stringify({ action:'push', token: cfg.token||'', payload })
+      headers: Object.assign({}, SB_HEADERS, {'Prefer':'resolution=merge-duplicates,return=minimal'}),
+      body: JSON.stringify(rows)
     });
-    const json = await res.json();
-    if(!json.ok){
-      markAttempt(false, json.msg||'Error tidak diketahui');
-      toast('Gagal: '+(json.msg||'Error tidak diketahui'),'danger');
-      renderView(); return;
-    }
+    if(!res.ok) throw new Error('HTTP '+res.status+' '+(await res.text()));
     markAttempt(true);
-    toast('Semua data berhasil disinkron ke cloud  ✓','success');
+    toast('Semua data berhasil disinkron ke Supabase ✓','success');
     renderView();
   }catch(e){
     markAttempt(false, e.message);
