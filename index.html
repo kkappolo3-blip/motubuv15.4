@@ -2506,13 +2506,18 @@ function renderArusKas(host){
       <thead><tr>
         <th class="col-no">No</th><th>Waktu</th><th>Jenis</th><th>Detail</th>
         <th class="col-num">Keluar</th><th class="col-num">Masuk</th><th class="col-num">Saldo</th>
+        <th class="col-num" style="min-width:90px">Aksi</th>
       </tr></thead>
       <tbody>
-        ${display.length===0?`<tr><td colspan="7" class="ak-empty">Belum ada arus kas pada filter ini.</td></tr>`:
+        ${display.length===0?`<tr><td colspan="8" class="ak-empty">Belum ada arus kas pada filter ini.</td></tr>`:
           display.map((r,idx)=>{
             const no=display.length-idx;
             const susTitle=(r._sus||[]).join(' \n');
-            return `<tr class="${r._sus&&r._sus.length?'sus':''}" onclick="${r._sus&&r._sus.length?`akShowSus(${JSON.stringify(r._sus).replace(/"/g,'&quot;')},'${esc(r.detail)}','${r.srcTab}')`:`go('${r.srcTab}')`}" style="cursor:pointer">
+            const rowClick = r._sus&&r._sus.length
+              ? `akShowSus(${JSON.stringify(r._sus).replace(/"/g,'&quot;')},'${esc(r.detail)}','${r.srcTab}')`
+              : `go('${r.srcTab}')`;
+            const sk = esc(r.srcKey||''), jn = esc(r.jenis||''), dt = esc(r.detail||'');
+            return `<tr class="${r._sus&&r._sus.length?'sus':''}" onclick="${rowClick}" style="cursor:pointer">
               <td class="col-no">${no}</td>
               <td>${fmtTanggalLengkap(r.at)}${r.edited?'<span class="ak-edited" title="Diedit setelah dibuat">✏️</span>':''}</td>
               <td><span class="ak-jenis ${akJenisClass(r.jenis)}">${r.jenis}</span></td>
@@ -2520,6 +2525,10 @@ function renderArusKas(host){
               <td class="col-num keluar">${fmtRpOrDash(r.keluar)}</td>
               <td class="col-num masuk">${fmtRpOrDash(r.masuk)}</td>
               <td class="col-num ${r.saldo<0?'saldo-neg':'saldo-pos'}">${fmtRp(r.saldo)}</td>
+              <td class="col-num" onclick="event.stopPropagation()">
+                <button class="btn btn-ghost btn-sm" title="Edit di sumber" onclick="event.stopPropagation();akEdit('${sk}','${r.srcTab}')">✏️</button>
+                <button class="btn btn-ghost btn-sm" title="Hapus entri" onclick="event.stopPropagation();akDelete('${sk}','${jn}','${dt}')" style="color:#B91C1C">🗑️</button>
+              </td>
             </tr>`;
           }).join('')
         }
@@ -2529,11 +2538,13 @@ function renderArusKas(host){
         <td class="col-num keluar">${fmtRp(totKeluar)}</td>
         <td class="col-num masuk">${fmtRp(totMasuk)}</td>
         <td class="col-num">${fmtRp(saldoAkhir)}</td>
+        <td></td>
       </tr></tfoot>`:''}
     </table>
     </div>
   `;
 }
+
 
 function akShowSus(reasons, detail, srcTab){
   openModal(`
@@ -2548,6 +2559,53 @@ function akShowSus(reasons, detail, srcTab){
     </div>
   `);
 }
+
+function akEdit(srcKey, srcTab){
+  if(srcKey==='opening'){ openSaldoAwal(); return; }
+  toast('Membuka tab sumber untuk mengedit entri ini','info');
+  go(srcTab);
+}
+
+function akDelete(srcKey, jenis, detail){
+  if(!srcKey) return;
+  if(!confirm(`Hapus entri arus kas ini?\n\n${jenis} — ${detail}\n\nData sumbernya juga akan dihapus dan tidak bisa dikembalikan.`)) return;
+  const i = srcKey.indexOf(':');
+  const type = i<0 ? srcKey : srcKey.slice(0,i);
+  const id   = i<0 ? '' : srcKey.slice(i+1);
+  try{
+    if(type==='opening'){
+      saveSaldoAwalData({jumlah:0, tanggal:Date.now(), catatan:''});
+    } else if(type==='sale' || type==='salecicil'){
+      save(K.sales, load(K.sales).filter(s=>String(s.id)!==id));
+    } else if(type==='order'){
+      save(K.orders, load(K.orders).filter(o=>String(o.id)!==id));
+    } else if(type==='exp'){
+      save(K.expenses, load(K.expenses).filter(e=>String(e.id)!==id));
+    } else if(type==='debt'){
+      save(K.bankDebts, load(K.bankDebts).filter(d=>String(d.id)!==id));
+    } else if(type==='debtpay'){
+      const arr=load(K.bankDebts);
+      arr.forEach(d=>{ d.pembayaran=(d.pembayaran||[]).filter(p=>String(p.id)!==id); });
+      save(K.bankDebts, arr);
+    } else if(type==='pay'){
+      const arr=load(K.customers);
+      arr.forEach(c=>(c.transaksi||[]).forEach(t=>{ t.pembayaran=(t.pembayaran||[]).filter(p=>String(p.id)!==id); }));
+      save(K.customers, arr);
+    } else if(type==='setor'){
+      save(K.resellerSetoran, load(K.resellerSetoran).filter(s=>String(s.id)!==id));
+    } else {
+      toast('Jenis entri tidak dikenal','error'); return;
+    }
+    logActivity('aruskas', jenis||'arus kas', 'Hapus entri: '+(detail||srcKey));
+    toast('Entri dihapus','success');
+    renderView();
+  }catch(err){
+    console.error(err);
+    toast('Gagal menghapus entri','error');
+  }
+}
+
+
 
 function exportAKCsv(){
   const rows=buildArusKas();
