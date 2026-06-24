@@ -600,11 +600,18 @@ function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(
 function load(key, def=[]){ try{ const v=localStorage.getItem(key); return v?JSON.parse(v):def; }catch(e){ return def; } }
 function save(key, val){
   localStorage.setItem(key, JSON.stringify(val));
-  // Jika ada update cloud yang tertunda untuk data yang sama, perubahan lokal ini harus menang.
-  // Ini mencegah stok lama/kosong dari realtime menimpa stok saat modal edit foto sedang dibuka.
+  if(key===K.stock && Array.isArray(val) && val.length){
+    window._sbLastGoodValues = window._sbLastGoodValues || {};
+    window._sbLastGoodValues.stock = val;
+    window._sbStockLocalWins = window._sbStockLocalWins || {};
+    const until = Date.now() + 15000;
+    val.forEach(p=>{ if(p && p.id) window._sbStockLocalWins[p.id] = until; });
+  }
+  // Untuk data selain stock, perubahan lokal tetap boleh menggugurkan update tertunda.
+  // Stock tidak dibuang karena update cloud mungkin berisi produk dari perangkat lain.
   try{
     if(window._sbDeferredRows){
-      delete window._sbDeferredRows[sbSheetKey(key)];
+      if(key!==K.stock) delete window._sbDeferredRows[sbSheetKey(key)];
       window._pendingRerender = Object.keys(window._sbDeferredRows).length > 0;
     }
   }catch(e){}
@@ -618,10 +625,61 @@ window._sbPushTimers = {};
 window._sbDeferredRows = {};
 window._sbSyncing = false;
 window._sbLastPullHash = '';
+window._sbInitialPullDone = false;
+window._sbLastGoodValues = {};
+window._sbStockLocalWins = {};
 function sbSheetKey(storageKey){ return (storageKey||'').replace('bld_',''); }
+function sbIsBadIncomingValue(storageKey, incoming){
+  if(incoming === undefined || incoming === null) return true;
+  if(storageKey===K.stock && !Array.isArray(incoming)) return true;
+  return false;
+}
+function sbMergeStockCloud(incoming){
+  if(!Array.isArray(incoming)) return false;
+  const local = load(K.stock);
+  if(!Array.isArray(local)) return false;
+  if(incoming.length===0 && local.length>0) return false;
+  const now = Date.now();
+  const localWins = window._sbStockLocalWins || {};
+  const byId = new Map();
+  incoming.forEach(p=>{ if(p && p.id) byId.set(p.id, p); });
+  local.forEach(p=>{
+    if(!p || !p.id) return;
+    if(!byId.has(p.id) || (localWins[p.id] && localWins[p.id] > now)) byId.set(p.id, p);
+  });
+  const merged = Array.from(byId.values());
+  if(merged.length) window._sbLastGoodValues.stock = merged;
+  const mergedJson = JSON.stringify(merged);
+  const localJson = localStorage.getItem(K.stock) || '';
+  if(mergedJson !== localJson){
+    localStorage.setItem(K.stock, mergedJson);
+    return true;
+  }
+  return false;
+}
+function sbApplyIncomingValue(storageKey, incoming){
+  if(sbIsBadIncomingValue(storageKey, incoming)) return false;
+  if(storageKey===K.stock) return sbMergeStockCloud(incoming);
+  const incomingJson = JSON.stringify(incoming);
+  const localJson = localStorage.getItem(storageKey) || '';
+  if(incomingJson !== localJson){
+    localStorage.setItem(storageKey, incomingJson);
+    return true;
+  }
+  return false;
+}
 async function sbPushKey(storageKey){
   const sheetKey = storageKey.replace('bld_','');
-  const row = { key: sheetKey, value: JSON.parse(localStorage.getItem(storageKey)||'null'), updated_at: new Date().toISOString() };
+  const value = JSON.parse(localStorage.getItem(storageKey)||'null');
+  if(storageKey===K.stock && Array.isArray(value) && value.length===0 && Array.isArray(window._sbLastGoodValues.stock) && window._sbLastGoodValues.stock.length){
+    console.warn('auto push stock dibatalkan: menolak menimpa cloud dengan array kosong');
+    return;
+  }
+  if(sbIsBadIncomingValue(storageKey, value)){
+    console.warn('auto push dibatalkan: nilai lokal tidak valid untuk', sheetKey);
+    return;
+  }
+  const row = { key: sheetKey, value, updated_at: new Date().toISOString() };
   try{
     await fetch(SUPABASE_URL+'/rest/v1/'+SB_TABLE+'?on_conflict=key', {
       method:'POST',
@@ -666,21 +724,19 @@ function sbApplyDeferredRows(){
       if(k==='gsConfig') return;
       const sheetKey = sbSheetKey(K[k]);
       if(sheetKey === row.key){
-        const incoming = JSON.stringify(row.value);
-        const local = localStorage.getItem(K[k]) || '';
-        if(incoming !== local){ localStorage.setItem(K[k], incoming); changed = true; }
+        if(sbApplyIncomingValue(K[k], row.value)) changed = true;
       }
     });
   });
   return changed;
 }
-async function sbAutoPull(silent){
-  // Hindari race: pastikan semua perubahan lokal sudah ter-push sebelum pull menimpa
-  await sbFlushPendingPushes();
+async function sbAutoPull(silent, opts){
+  opts = opts || {};
+  // Pull harus membaca cloud dulu; jangan push snapshot lokal sebelum tahu data terbaru.
   // ⛔ Jangan pull saat modal terbuka / sedang upload foto — kalau dipaksa pull lalu re-render,
   //    field input di modal (mis. qty) bisa "hilang" karena re-render mengganti DOM
   const modalOpenNow = document.getElementById('modal-bg')?.classList.contains('show');
-  if(modalOpenNow || window._uploadingPhoto){ return false; }
+  if(!opts.force && (modalOpenNow || window._uploadingPhoto)){ return false; }
   try{
     window._sbSyncing = true;
     const res = await fetch(SUPABASE_URL+'/rest/v1/'+SB_TABLE+'?select=key,value,updated_at', { headers: SB_HEADERS, cache:'no-store' });
@@ -692,12 +748,7 @@ async function sbAutoPull(silent){
       if(k==='gsConfig') return;
       const sheetKey = K[k].replace('bld_','');
       if(data[sheetKey] !== undefined){
-        const incoming = JSON.stringify(data[sheetKey]);
-        const local = localStorage.getItem(K[k]) || '';
-        if(incoming !== local){
-          localStorage.setItem(K[k], incoming);
-          changed=true;
-        }
+        if(sbApplyIncomingValue(K[k], data[sheetKey])) changed=true;
       }
     });
     window._gsStatus='on'; if(typeof renderGSChip==='function') renderGSChip();
@@ -709,6 +760,7 @@ async function sbAutoPull(silent){
     return false;
   }finally{
     window._sbSyncing = false;
+    window._sbInitialPullDone = true;
   }
 }
 function sbStartAutoSync(){
@@ -733,7 +785,7 @@ function sbStartAutoSync(){
         const modalOpen = document.getElementById('modal-bg')?.classList.contains('show');
         if(modalOpen || window._uploadingPhoto){
           // Jangan sentuh localStorage saat modal terbuka. Simpan update cloud di memori dulu.
-          // Kalau user klik Simpan, save() akan membuang pending row untuk tabel yang sama agar stok lokal tidak tertimpa.
+          // Untuk stock, pending row nanti digabung agar produk dari perangkat lain tidak hilang.
           sbQueueDeferredRow(row);
           return;
         }
@@ -742,12 +794,7 @@ function sbStartAutoSync(){
           if(k==='gsConfig') return;
           const sheetKey = K[k].replace('bld_','');
           if(sheetKey === row.key){
-            const incoming = JSON.stringify(row.value);
-            const local = localStorage.getItem(K[k]) || '';
-            if(incoming !== local){
-              localStorage.setItem(K[k], incoming);
-              changed = true;
-            }
+            if(sbApplyIncomingValue(K[k], row.value)) changed = true;
           }
         });
         if(changed && typeof renderView==='function'){ try{ renderView(); }catch(e){} }
@@ -1094,7 +1141,7 @@ function openModal(html){
 function closeModal(){
   document.getElementById('modal-bg').classList.remove('show');
   // Terapkan update cloud yang ditunda hanya setelah modal tertutup.
-  // Update untuk tabel yang baru saja disimpan sudah dibuang oleh save(), jadi tidak menimpa hasil edit.
+  // Stock digabung by id agar update perangkat lain tidak meratakan daftar lokal.
   const changed = (typeof sbApplyDeferredRows==='function') ? sbApplyDeferredRows() : false;
   if(changed && typeof renderView==='function'){
     try{ renderView(); }catch(e){}
@@ -1558,8 +1605,12 @@ function applySuggest(){
   const hb=+val('p-hb')||0; let hpp=+val('p-hpp')||0; if(!hpp) hpp=hb;
   const el=document.getElementById('p-hj'); if(el) el.value=suggestPrice(hpp);
 }
-function saveStock(pid, isNew){
+async function saveStock(pid, isNew){
   if(window._uploadingPhoto){ toast('Tunggu upload foto selesai atau klik Hapus gambar dulu','danger'); return; }
+  if(!window._sbInitialPullDone && typeof sbAutoPull==='function'){
+    toast('Sinkronisasi data dulu...', 'success');
+    await sbAutoPull(true, {force:true});
+  }
   const stock=load(K.stock);
   const data={id:pid, nama:val('p-nama').trim(), varian:val('p-var').trim(), qty:+val('p-qty')||0, hargaBeli:+val('p-hb')||0, hpp:+val('p-hpp')||0, hargaJual:+val('p-hj')||0, img:_editStockImg||'', tanggalOrder: (val('p-tord')? new Date(val('p-tord')).getTime() : 0), grupOrder: val('p-gord').trim()};
   data.key=normKey(data.nama, data.varian);
