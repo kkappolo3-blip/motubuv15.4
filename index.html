@@ -598,14 +598,27 @@ const K = {
 
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
 function load(key, def=[]){ try{ const v=localStorage.getItem(key); return v?JSON.parse(v):def; }catch(e){ return def; } }
-function save(key, val){ localStorage.setItem(key, JSON.stringify(val)); if(typeof sbSchedulePush==='function') sbSchedulePush(key); }
+function save(key, val){
+  localStorage.setItem(key, JSON.stringify(val));
+  // Jika ada update cloud yang tertunda untuk data yang sama, perubahan lokal ini harus menang.
+  // Ini mencegah stok lama/kosong dari realtime menimpa stok saat modal edit foto sedang dibuka.
+  try{
+    if(window._sbDeferredRows){
+      delete window._sbDeferredRows[sbSheetKey(key)];
+      window._pendingRerender = Object.keys(window._sbDeferredRows).length > 0;
+    }
+  }catch(e){}
+  if(typeof sbSchedulePush==='function') sbSchedulePush(key);
+}
 
 /* ════════════════════════════════════════════════
    AUTO SYNC SUPABASE (otomatis push/pull lintas perangkat)
    ════════════════════════════════════════════════ */
 window._sbPushTimers = {};
+window._sbDeferredRows = {};
 window._sbSyncing = false;
 window._sbLastPullHash = '';
+function sbSheetKey(storageKey){ return (storageKey||'').replace('bld_',''); }
 async function sbPushKey(storageKey){
   const sheetKey = storageKey.replace('bld_','');
   const row = { key: sheetKey, value: JSON.parse(localStorage.getItem(storageKey)||'null'), updated_at: new Date().toISOString() };
@@ -631,6 +644,35 @@ async function sbFlushPendingPushes(){
     const t=window._sbPushTimers[k];
     if(t){ clearTimeout(t); delete window._sbPushTimers[k]; try{ await sbPushKey(k); }catch(e){} }
   }
+}
+function sbQueueDeferredRow(row){
+  if(!row || !row.key || row.value===undefined) return;
+  window._sbDeferredRows = window._sbDeferredRows || {};
+  window._sbDeferredRows[row.key] = row;
+  window._pendingRerender = true;
+}
+function sbApplyDeferredRows(){
+  const modalOpen = document.getElementById('modal-bg')?.classList.contains('show');
+  if(modalOpen || window._uploadingPhoto) return false;
+  const pending = window._sbDeferredRows || {};
+  const rows = Object.values(pending);
+  window._sbDeferredRows = {};
+  window._pendingRerender = false;
+  if(!rows.length) return false;
+  let changed = false;
+  rows.forEach(row=>{
+    if(!row || !row.key || row.value===undefined) return;
+    Object.keys(K).forEach(k=>{
+      if(k==='gsConfig') return;
+      const sheetKey = sbSheetKey(K[k]);
+      if(sheetKey === row.key){
+        const incoming = JSON.stringify(row.value);
+        const local = localStorage.getItem(K[k]) || '';
+        if(incoming !== local){ localStorage.setItem(K[k], incoming); changed = true; }
+      }
+    });
+  });
+  return changed;
 }
 async function sbAutoPull(silent){
   // Hindari race: pastikan semua perubahan lokal sudah ter-push sebelum pull menimpa
@@ -690,18 +732,9 @@ function sbStartAutoSync(){
         // ⛔ Jangan re-render kalau modal terbuka / lagi upload foto
         const modalOpen = document.getElementById('modal-bg')?.classList.contains('show');
         if(modalOpen || window._uploadingPhoto){
-          // tetap update localStorage, tapi tunda render sampai modal tertutup
-          let changedSilent = false;
-          Object.keys(K).forEach(k=>{
-            if(k==='gsConfig') return;
-            const sheetKey = K[k].replace('bld_','');
-            if(sheetKey === row.key){
-              const incoming = JSON.stringify(row.value);
-              const local = localStorage.getItem(K[k]) || '';
-              if(incoming !== local){ localStorage.setItem(K[k], incoming); changedSilent = true; }
-            }
-          });
-          if(changedSilent) window._pendingRerender = true;
+          // Jangan sentuh localStorage saat modal terbuka. Simpan update cloud di memori dulu.
+          // Kalau user klik Simpan, save() akan membuang pending row untuk tabel yang sama agar stok lokal tidak tertimpa.
+          sbQueueDeferredRow(row);
           return;
         }
         let changed = false;
@@ -1060,9 +1093,10 @@ function openModal(html){
 }
 function closeModal(){
   document.getElementById('modal-bg').classList.remove('show');
-  // Kalau ada update realtime yang ditunda saat modal terbuka, render sekarang
-  if(window._pendingRerender){
-    window._pendingRerender = false;
+  // Terapkan update cloud yang ditunda hanya setelah modal tertutup.
+  // Update untuk tabel yang baru saja disimpan sudah dibuang oleh save(), jadi tidak menimpa hasil edit.
+  const changed = (typeof sbApplyDeferredRows==='function') ? sbApplyDeferredRows() : false;
+  if(changed && typeof renderView==='function'){
     try{ renderView(); }catch(e){}
   }
 }
@@ -1399,7 +1433,7 @@ function editStock(id, isNew){
         <div id="p-img-prev" class="preview" style="${_editStockImg?`background-image:url('${esc(_editStockImg)}')`:''}">${_editStockImg?'':'📦'}</div>
         <div style="display:flex;flex-direction:column;gap:6px">
           <input type="file" id="p-img" accept="image/*" onchange="onPickStockImg(this)">
-          ${_editStockImg?`<button type="button" class="btn btn-ghost btn-sm" onclick="clearStockImg()">Hapus gambar</button>`:''}
+          <button type="button" id="p-img-clear" class="btn btn-ghost btn-sm" onclick="clearStockImg()" style="${_editStockImg?'':'display:none'}">Hapus gambar</button>
           <span class="muted" style="font-size:11px">Membantu user membedakan barang saat input penjualan. Untuk produk yang sudah ada, cukup pilih file baru — foto akan diganti.</span>
         </div>
       </div>
@@ -1432,6 +1466,7 @@ function editStock(id, isNew){
   suggestStockPrice();
 }
 let _editStockImg='';
+let _editStockImgToken=0;
 const SB_BUCKET='produk';
 async function uploadToBucket(blob, ext){
   const path = 'p-'+Date.now()+'-'+Math.random().toString(36).slice(2,8)+'.'+(ext||'jpg');
@@ -1447,48 +1482,71 @@ async function uploadToBucket(blob, ext){
 function onPickStockImg(inp){
   const f=inp.files&&inp.files[0]; if(!f) return;
   if(f.size>5000000){ toast('Gambar terlalu besar (maks ~5MB)','danger'); inp.value=''; return; }
-  // Tandai sedang upload — disable tombol Simpan & skip auto-pull supaya field qty/nama tidak hilang
+  const token = ++_editStockImgToken;
+  // Tandai sedang upload — tombol Simpan ditahan, tapi tombol Hapus gambar tetap bisa diklik.
   window._uploadingPhoto = true;
   const saveBtn = document.querySelector('#modal .modal-foot .btn-primary');
-  const originalSaveLabel = saveBtn ? saveBtn.textContent : '';
+  const clearBtn = document.getElementById('p-img-clear');
   if(saveBtn){ saveBtn.disabled = true; saveBtn.textContent = '⏳ Mengunggah foto…'; }
+  if(clearBtn){ clearBtn.style.display='inline-flex'; clearBtn.disabled=false; clearBtn.textContent='Hapus gambar'; }
+  const finishUpload = ()=>{
+    if(token !== _editStockImgToken) return;
+    window._uploadingPhoto = false;
+    if(saveBtn){ saveBtn.disabled = false; saveBtn.textContent = 'Simpan'; }
+  };
+  const failUpload = (msg)=>{
+    if(token !== _editStockImgToken) return;
+    window._uploadingPhoto = false;
+    if(saveBtn){ saveBtn.disabled = false; saveBtn.textContent = 'Simpan'; }
+    toast(msg || 'Gagal membaca gambar','danger');
+  };
   const img=new Image();
   const reader=new FileReader();
+  reader.onerror=()=>failUpload('Gagal membaca file gambar');
   reader.onload=()=>{
+    img.onerror=()=>failUpload('Format gambar tidak bisa dibaca');
     img.onload=async ()=>{
+      if(token !== _editStockImgToken) return;
       // resize to max 800px untuk efisiensi
       const max=800; let w=img.width, h=img.height;
       if(w>max||h>max){ const r=Math.min(max/w,max/h); w=Math.round(w*r); h=Math.round(h*r); }
       const c=document.createElement('canvas'); c.width=w; c.height=h;
       c.getContext('2d').drawImage(img,0,0,w,h);
       const prev=document.getElementById('p-img-prev');
-      // tampilkan preview lokal dulu
+      // tampilkan preview lokal dulu, dan simpan sementara supaya bisa langsung dihapus tanpa tunggu upload selesai
       const localDataUrl = c.toDataURL('image/jpeg', 0.82);
+      _editStockImg = localDataUrl;
       if(prev){ prev.style.backgroundImage=`url('${localDataUrl}')`; prev.textContent=''; }
-      // upload ke bucket Supabase
       try{
         const blob = await new Promise(r=>c.toBlob(r, 'image/jpeg', 0.82));
         const publicUrl = await uploadToBucket(blob, 'jpg');
+        if(token !== _editStockImgToken) return;
         _editStockImg = publicUrl;
         toast('Foto terunggah ke cloud ✓','success');
       }catch(e){
+        if(token !== _editStockImgToken) return;
         console.warn('Upload bucket gagal, pakai data URL:', e);
         _editStockImg = localDataUrl;
         toast('Upload bucket gagal — disimpan lokal saja. Cek bucket "produk" sudah dibuat & public.','danger');
+      }finally{
+        finishUpload();
       }
-      // Selesai upload — aktifkan tombol Simpan
-      window._uploadingPhoto = false;
-      if(saveBtn){ saveBtn.disabled = false; saveBtn.textContent = originalSaveLabel || 'Simpan'; }
     };
     img.src=reader.result;
   };
   reader.readAsDataURL(f);
 }
 function clearStockImg(){
+  _editStockImgToken++;
   _editStockImg='';
+  window._uploadingPhoto = false;
   const prev=document.getElementById('p-img-prev');
   if(prev){ prev.style.backgroundImage=''; prev.textContent='📦'; }
   const inp=document.getElementById('p-img'); if(inp) inp.value='';
+  const clearBtn=document.getElementById('p-img-clear');
+  if(clearBtn){ clearBtn.style.display='none'; clearBtn.disabled=false; clearBtn.textContent='Hapus gambar'; }
+  const saveBtn=document.querySelector('#modal .modal-foot .btn-primary');
+  if(saveBtn){ saveBtn.disabled=false; saveBtn.textContent='Simpan'; }
 }
 function suggestStockPrice(){
   const hb=+val('p-hb')||0; let hpp=+val('p-hpp')||0; if(!hpp) hpp=hb;
@@ -1501,6 +1559,7 @@ function applySuggest(){
   const el=document.getElementById('p-hj'); if(el) el.value=suggestPrice(hpp);
 }
 function saveStock(pid, isNew){
+  if(window._uploadingPhoto){ toast('Tunggu upload foto selesai atau klik Hapus gambar dulu','danger'); return; }
   const stock=load(K.stock);
   const data={id:pid, nama:val('p-nama').trim(), varian:val('p-var').trim(), qty:+val('p-qty')||0, hargaBeli:+val('p-hb')||0, hpp:+val('p-hpp')||0, hargaJual:+val('p-hj')||0, img:_editStockImg||'', tanggalOrder: (val('p-tord')? new Date(val('p-tord')).getTime() : 0), grupOrder: val('p-gord').trim()};
   data.key=normKey(data.nama, data.varian);
